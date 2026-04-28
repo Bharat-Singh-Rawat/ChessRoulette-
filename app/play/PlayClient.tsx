@@ -14,6 +14,7 @@ type GameInfo = {
   opponent: { username: string };
   fen: string;
   turn: Color;
+  vsBot: boolean;
 };
 type GameState = {
   fen: string;
@@ -62,17 +63,25 @@ export default function PlayClient({ username }: { username: string }) {
   }, []);
 
   // White is the WebRTC initiator. Hook tears down between matches via gameId dep.
+  // In bot games, only the local camera turns on (no peer to connect to).
   const webrtc = useWebRTC({
     socket,
     gameId: phase === "playing" || phase === "over" ? game?.gameId ?? null : null,
     isInitiator: game?.color === "white",
     enabled: (phase === "playing" || phase === "over") && !!game,
+    localOnly: !!game?.vsBot,
   });
 
   function findMatch() {
     setNotice(null);
     setResult(null);
     socketRef.current?.emit("queue:join");
+  }
+
+  function findBotMatch() {
+    setNotice(null);
+    setResult(null);
+    socketRef.current?.emit("queue:join_bot");
   }
 
   function leaveQueue() {
@@ -127,18 +136,28 @@ export default function PlayClient({ username }: { username: string }) {
       {phase === "idle" && (
         <Panel>
           <p className="text-sm text-zinc-600 dark:text-zinc-400">
-            FIFO matchmaking — first two waiting players get paired. When you pair,
-            your browser will ask for camera and mic so you can see your opponent.
-            You can deny and still play.
+            Pair with a real player (FIFO matchmaking) or jump straight into a
+            practice game vs a computer opponent. Either way the browser will ask
+            for your camera and mic — you can deny and still play.
           </p>
-          <button
-            type="button"
-            onClick={findMatch}
-            disabled={!connected}
-            className="self-start rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-          >
-            Find a match
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={findMatch}
+              disabled={!connected}
+              className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              Find a match
+            </button>
+            <button
+              type="button"
+              onClick={findBotMatch}
+              disabled={!connected}
+              className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 transition-colors hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+            >
+              Practice vs computer
+            </button>
+          </div>
         </Panel>
       )}
 
@@ -177,6 +196,7 @@ export default function PlayClient({ username }: { username: string }) {
               status={webrtc.status}
               error={webrtc.error}
               opponentName={game.opponent.username}
+              vsBot={game.vsBot}
             />
             <Panel>
               <div className="flex flex-col gap-3 text-sm">
@@ -292,11 +312,13 @@ function OpponentVideo({
   status,
   error,
   opponentName,
+  vsBot,
 }: {
   stream: MediaStream | null;
   status: WebRTCStatus;
   error: string | null;
   opponentName: string;
+  vsBot: boolean;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
   useEffect(() => {
@@ -305,7 +327,13 @@ function OpponentVideo({
 
   return (
     <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-900 dark:border-zinc-800">
-      {stream ? (
+      {vsBot ? (
+        <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-center text-zinc-300">
+          <span className="text-5xl">🤖</span>
+          <span className="text-base font-medium">{opponentName}</span>
+          <span className="text-xs text-zinc-500">Bots don't have webcams</span>
+        </div>
+      ) : stream ? (
         <video
           ref={ref}
           autoPlay

@@ -10,11 +10,15 @@ type Game = {
   chess: Chess;
   status: "in_progress" | "finished";
   startedAt: Date;
+  vsBot?: boolean;
 };
 
 const games = new Map<string, Game>();
 const queue: Side[] = [];
 const userToGame = new Map<string, string>();
+
+const BOT_USER_ID = "bot:random";
+const BOT_USERNAME = "ChessBot";
 
 function colorFor(game: Game, userId: string): Color | null {
   if (game.white.userId === userId) return "white";
@@ -38,7 +42,19 @@ function matchFoundPayload(game: Game, color: Color) {
     opponent: { username: opp.username },
     fen: game.chess.fen(),
     turn: game.chess.turn() === "w" ? ("white" as const) : ("black" as const),
+    vsBot: !!game.vsBot,
   };
+}
+
+function detectGameOver(game: Game): { winner: Color | null; reason: string } | null {
+  if (!game.chess.isGameOver()) return null;
+  if (game.chess.isCheckmate()) {
+    return { winner: game.chess.turn() === "w" ? "black" : "white", reason: "checkmate" };
+  }
+  if (game.chess.isStalemate()) return { winner: null, reason: "stalemate" };
+  if (game.chess.isThreefoldRepetition()) return { winner: null, reason: "threefold_repetition" };
+  if (game.chess.isInsufficientMaterial()) return { winner: null, reason: "insufficient_material" };
+  return { winner: null, reason: "draw" };
 }
 
 function finalize(io: Server, game: Game, result: { winner: Color | null; reason: string }) {
@@ -50,6 +66,40 @@ function finalize(io: Server, game: Game, result: { winner: Color | null; reason
     games.delete(game.id);
   }, 60_000);
 }
+
+// --- Bot ----------------------------------------------------------------
+function pickBotMove(chess: Chess): { from: string; to: string; promotion?: string } | null {
+  const moves = chess.moves({ verbose: true });
+  if (!moves.length) return null;
+  // Slightly biased random: prefer captures and checks over plain moves.
+  const score = (m: (typeof moves)[number]) =>
+    (m.captured ? 5 : 0) + (m.flags.includes("p") ? 2 : 0) + Math.random();
+  moves.sort((a, b) => score(b) - score(a));
+  const m = moves[0];
+  return { from: m.from, to: m.to, promotion: m.promotion };
+}
+
+function maybeBotMove(io: Server, game: Game) {
+  if (!game.vsBot || game.status !== "in_progress") return;
+  const turnColor: Color = game.chess.turn() === "w" ? "white" : "black";
+  const botIsWhite = game.white.userId === BOT_USER_ID;
+  const botColor: Color = botIsWhite ? "white" : "black";
+  if (turnColor !== botColor) return;
+  const delay = 500 + Math.floor(Math.random() * 800);
+  setTimeout(() => {
+    if (game.status !== "in_progress") return;
+    if ((game.chess.turn() === "w" ? "white" : "black") !== botColor) return;
+    const choice = pickBotMove(game.chess);
+    if (!choice) return;
+    const result = game.chess.move({ ...choice, promotion: choice.promotion ?? "q" });
+    if (!result) return;
+    pushGameState(io, game, { from: result.from, to: result.to, san: result.san });
+    const over = detectGameOver(game);
+    if (over) finalize(io, game, over);
+  }, delay);
+}
+
+// ------------------------------------------------------------------------
 
 export function handleConnection(io: Server, socket: Socket) {
   const user = socket.data.user as { id: string; username: string };
@@ -115,6 +165,49 @@ export function handleConnection(io: Server, socket: Socket) {
     if (i >= 0) queue.splice(i, 1);
   });
 
+  socket.on("queue:join_bot", () => {
+    // If user already has an active game, just resume it instead of starting a new one.
+    const existingGameId = userToGame.get(user.id);
+    const existing = existingGameId ? games.get(existingGameId) : null;
+    if (existing && existing.status === "in_progress") {
+      const youAre = colorFor(existing, user.id);
+      if (!youAre) return;
+      if (youAre === "white") existing.white.socketId = socket.id;
+      else existing.black.socketId = socket.id;
+      socket.join(existing.id);
+      socket.emit("match:found", matchFoundPayload(existing, youAre));
+      return;
+    }
+
+    // Drop from queue if waiting.
+    const qi = queue.findIndex((q) => q.userId === user.id);
+    if (qi >= 0) queue.splice(qi, 1);
+
+    const humanIsWhite = Math.random() < 0.5;
+    const human: Side = { userId: user.id, username: user.username, socketId: socket.id };
+    const bot: Side = { userId: BOT_USER_ID, username: BOT_USERNAME, socketId: "" };
+    const white = humanIsWhite ? human : bot;
+    const black = humanIsWhite ? bot : human;
+    const gameId = `g_bot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const chess = new Chess();
+    const game: Game = {
+      id: gameId,
+      white,
+      black,
+      chess,
+      status: "in_progress",
+      startedAt: new Date(),
+      vsBot: true,
+    };
+    games.set(gameId, game);
+    userToGame.set(user.id, gameId);
+    socket.join(gameId);
+    socket.emit("match:found", matchFoundPayload(game, humanIsWhite ? "white" : "black"));
+
+    // If bot is white, it moves first.
+    maybeBotMove(io, game);
+  });
+
   socket.on(
     "game:move",
     (payload: { gameId: string; from: string; to: string; promotion?: string }) => {
@@ -142,24 +235,14 @@ export function handleConnection(io: Server, socket: Socket) {
 
       pushGameState(io, game, { from: move.from, to: move.to, san: move.san });
 
-      if (game.chess.isGameOver()) {
-        let result: { winner: Color | null; reason: string };
-        if (game.chess.isCheckmate()) {
-          result = {
-            winner: game.chess.turn() === "w" ? "black" : "white",
-            reason: "checkmate",
-          };
-        } else if (game.chess.isStalemate()) {
-          result = { winner: null, reason: "stalemate" };
-        } else if (game.chess.isThreefoldRepetition()) {
-          result = { winner: null, reason: "threefold_repetition" };
-        } else if (game.chess.isInsufficientMaterial()) {
-          result = { winner: null, reason: "insufficient_material" };
-        } else {
-          result = { winner: null, reason: "draw" };
-        }
-        finalize(io, game, result);
+      const over = detectGameOver(game);
+      if (over) {
+        finalize(io, game, over);
+        return;
       }
+
+      // If playing a bot, schedule the bot's reply.
+      maybeBotMove(io, game);
     },
   );
 
@@ -181,6 +264,7 @@ export function handleConnection(io: Server, socket: Socket) {
   function relayIfInGame(gameId: string, event: string, payload: unknown) {
     const game = games.get(gameId);
     if (!game || game.status !== "in_progress") return;
+    if (game.vsBot) return; // bot has no peer to receive
     if (!colorFor(game, user.id)) return;
     socket.to(gameId).emit(event, payload);
   }
@@ -201,7 +285,7 @@ export function handleConnection(io: Server, socket: Socket) {
     const gameId = userToGame.get(user.id);
     if (gameId) {
       const game = games.get(gameId);
-      if (game && game.status === "in_progress") {
+      if (game && game.status === "in_progress" && !game.vsBot) {
         socket.to(gameId).emit("game:opponent_disconnected");
       }
     }

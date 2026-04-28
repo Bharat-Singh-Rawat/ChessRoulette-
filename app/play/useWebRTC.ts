@@ -21,9 +21,11 @@ type Args = {
   gameId: string | null;
   isInitiator: boolean;
   enabled: boolean;
+  /** When true, only request local camera; skip peer connection (no remote peer). */
+  localOnly?: boolean;
 };
 
-export function useWebRTC({ socket, gameId, isInitiator, enabled }: Args) {
+export function useWebRTC({ socket, gameId, isInitiator, enabled, localOnly }: Args) {
   const [status, setStatus] = useState<WebRTCStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -79,9 +81,11 @@ export function useWebRTC({ socket, gameId, isInitiator, enabled }: Args) {
       }
     };
 
-    socket.on("webrtc:offer", onOffer);
-    socket.on("webrtc:answer", onAnswer);
-    socket.on("webrtc:ice", onIce);
+    if (!localOnly) {
+      socket.on("webrtc:offer", onOffer);
+      socket.on("webrtc:answer", onAnswer);
+      socket.on("webrtc:ice", onIce);
+    }
 
     (async () => {
       setStatus("requesting_camera");
@@ -102,6 +106,13 @@ export function useWebRTC({ socket, gameId, isInitiator, enabled }: Args) {
         return;
       }
       setLocalStream(stream);
+
+      // localOnly path: no peer to connect to, just show local preview.
+      if (localOnly) {
+        setStatus("connected");
+        return;
+      }
+
       setStatus("connecting");
 
       pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
@@ -139,9 +150,11 @@ export function useWebRTC({ socket, gameId, isInitiator, enabled }: Args) {
 
     return () => {
       cancelled = true;
-      socket.off("webrtc:offer", onOffer);
-      socket.off("webrtc:answer", onAnswer);
-      socket.off("webrtc:ice", onIce);
+      if (!localOnly) {
+        socket.off("webrtc:offer", onOffer);
+        socket.off("webrtc:answer", onAnswer);
+        socket.off("webrtc:ice", onIce);
+      }
       pc?.close();
       pcRef.current = null;
       stream?.getTracks().forEach((t) => t.stop());
@@ -149,7 +162,7 @@ export function useWebRTC({ socket, gameId, isInitiator, enabled }: Args) {
       setRemoteStream(null);
       setStatus("idle");
     };
-  }, [enabled, gameId, isInitiator, socket]);
+  }, [enabled, gameId, isInitiator, socket, localOnly]);
 
   return { status, error, localStream, remoteStream };
 }
