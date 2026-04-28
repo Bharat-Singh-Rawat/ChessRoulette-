@@ -19,6 +19,9 @@ model User {
   draws        Int      @default(0)
   tokens       Int      @default(50)
 
+  // JSON array of opening IDs (e.g. ["sicilian","ruy_lopez"]). Empty = no preferences.
+  preferredOpenings String @default("[]")
+
   createdAt    DateTime @default(now())
 
   whiteGames   Game[]   @relation("WhiteGames")

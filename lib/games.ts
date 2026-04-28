@@ -2,9 +2,15 @@ import { Chess } from "chess.js";
 import type { Server, Socket } from "socket.io";
 import { prisma } from "./db";
 import { computeNewRatings, type EloOutcome } from "./elo";
+import { parsePreferences, nameForId } from "./openings";
 
 type Color = "white" | "black";
-type Side = { userId: string; username: string; socketId: string };
+type Side = {
+  userId: string;
+  username: string;
+  socketId: string;
+  preferences: string[];
+};
 type Game = {
   id: string;
   white: Side;
@@ -13,6 +19,7 @@ type Game = {
   status: "in_progress" | "finished";
   startedAt: Date;
   vsBot?: boolean;
+  matchedOpening?: string; // opening id, if pair shares one
 };
 
 const games = new Map<string, Game>();
@@ -45,6 +52,9 @@ function matchFoundPayload(game: Game, color: Color) {
     fen: game.chess.fen(),
     turn: game.chess.turn() === "w" ? ("white" as const) : ("black" as const),
     vsBot: !!game.vsBot,
+    matchedOpening: game.matchedOpening
+      ? { id: game.matchedOpening, name: nameForId(game.matchedOpening) }
+      : null,
   };
 }
 
@@ -193,7 +203,7 @@ function maybeBotMove(io: Server, game: Game) {
 export function handleConnection(io: Server, socket: Socket) {
   const user = socket.data.user as { id: string; username: string };
 
-  socket.on("queue:join", () => {
+  socket.on("queue:join", async () => {
     // If user already has an active game, resume it
     const existingGameId = userToGame.get(user.id);
     const existing = existingGameId ? games.get(existingGameId) : null;
@@ -215,23 +225,53 @@ export function handleConnection(io: Server, socket: Socket) {
       return;
     }
 
-    queue.push({ userId: user.id, username: user.username, socketId: socket.id });
+    // Load user's preferences from the DB.
+    const prefRow = await prisma.user
+      .findUnique({
+        where: { id: user.id },
+        select: { preferredOpenings: true },
+      })
+      .catch(() => null);
+    const preferences = parsePreferences(prefRow?.preferredOpenings);
 
-    if (queue.length >= 2) {
-      const a = queue.shift()!;
-      const b = queue.shift()!;
-      const aIsWhite = Math.random() < 0.5;
-      const white = aIsWhite ? a : b;
-      const black = aIsWhite ? b : a;
+    const newcomer: Side = {
+      userId: user.id,
+      username: user.username,
+      socketId: socket.id,
+      preferences,
+    };
+
+    // Find a partner: prefer overlap with newcomer, else oldest in queue.
+    let partnerIdx = -1;
+    if (preferences.length > 0) {
+      partnerIdx = queue.findIndex((q) =>
+        q.preferences.some((p) => preferences.includes(p)),
+      );
+    }
+    if (partnerIdx === -1 && queue.length > 0) {
+      // Or maybe the queued player has prefs that match the newcomer (catch the
+      // case where newcomer has no prefs but queued does — we'd still want them
+      // paired even though there's no "overlap").
+      partnerIdx = 0;
+    }
+
+    if (partnerIdx >= 0) {
+      const partner = queue.splice(partnerIdx, 1)[0]!;
+      const newcomerIsWhite = Math.random() < 0.5;
+      const white = newcomerIsWhite ? newcomer : partner;
+      const black = newcomerIsWhite ? partner : newcomer;
+      const overlap = newcomer.preferences.find((p) =>
+        partner.preferences.includes(p),
+      );
       const gameId = `g_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const chess = new Chess();
       const game: Game = {
         id: gameId,
         white,
         black,
-        chess,
+        chess: new Chess(),
         status: "in_progress",
         startedAt: new Date(),
+        matchedOpening: overlap,
       };
       games.set(gameId, game);
       userToGame.set(white.userId, gameId);
@@ -245,6 +285,7 @@ export function handleConnection(io: Server, socket: Socket) {
       whiteSock?.emit("match:found", matchFoundPayload(game, "white"));
       blackSock?.emit("match:found", matchFoundPayload(game, "black"));
     } else {
+      queue.push(newcomer);
       socket.emit("queue:waiting", { position: queue.length });
     }
   });
@@ -273,8 +314,8 @@ export function handleConnection(io: Server, socket: Socket) {
     if (qi >= 0) queue.splice(qi, 1);
 
     const humanIsWhite = Math.random() < 0.5;
-    const human: Side = { userId: user.id, username: user.username, socketId: socket.id };
-    const bot: Side = { userId: BOT_USER_ID, username: BOT_USERNAME, socketId: "" };
+    const human: Side = { userId: user.id, username: user.username, socketId: socket.id, preferences: [] };
+    const bot: Side = { userId: BOT_USER_ID, username: BOT_USERNAME, socketId: "", preferences: [] };
     const white = humanIsWhite ? human : bot;
     const black = humanIsWhite ? bot : human;
     const gameId = `g_bot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;

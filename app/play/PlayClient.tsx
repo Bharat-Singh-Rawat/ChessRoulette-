@@ -15,6 +15,7 @@ type GameInfo = {
   fen: string;
   turn: Color;
   vsBot: boolean;
+  matchedOpening: { id: string; name: string } | null;
 };
 type GameState = {
   fen: string;
@@ -211,6 +212,9 @@ export default function PlayClient({ username }: { username: string }) {
               <div className="flex flex-col gap-3 text-sm">
                 <Row label="You" value={`${username} (${game.color})`} />
                 <Row label="Opponent" value={game.opponent.username} />
+                {game.matchedOpening && (
+                  <Row label="Matched on" value={game.matchedOpening.name} />
+                )}
                 <Row
                   label="Turn"
                   value={

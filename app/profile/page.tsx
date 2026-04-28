@@ -1,6 +1,8 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/db";
+import { parsePreferences } from "@/lib/openings";
+import OpeningsPicker from "./OpeningsPicker";
 
 export const dynamic = "force-dynamic";
 
@@ -19,10 +21,13 @@ export default async function ProfilePage() {
       draws: true,
       tokens: true,
       createdAt: true,
+      preferredOpenings: true,
     },
   });
 
   if (!user) redirect("/login");
+
+  const initialOpenings = parsePreferences(user.preferredOpenings);
 
   const stats = [
     { label: "ELO rating", value: user.rating },
@@ -59,10 +64,7 @@ export default async function ProfilePage() {
         ))}
       </section>
 
-      <p className="text-sm text-zinc-600 dark:text-zinc-400">
-        Real games and the leaderboard arrive in sub-step 3 (real-time matches) and
-        sub-step 4 (ELO ladder). Until then your rating sits at the 1200 baseline.
-      </p>
+      <OpeningsPicker initial={initialOpenings} />
     </div>
   );
 }
