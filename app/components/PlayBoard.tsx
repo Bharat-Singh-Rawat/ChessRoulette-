@@ -29,7 +29,12 @@ export default function PlayBoard() {
   function tryMove(sourceSquare: string, targetSquare: string | null): boolean {
     if (!targetSquare) return false;
     const next = new Chess(fen);
-    const move = next.move({ from: sourceSquare, to: targetSquare, promotion: "q" });
+    let move;
+    try {
+      move = next.move({ from: sourceSquare, to: targetSquare, promotion: "q" });
+    } catch {
+      return false;
+    }
     if (!move) return false;
     setFen(next.fen());
     return true;
