@@ -122,7 +122,7 @@ function matchFoundPayload(game: Game, color: Color) {
   return {
     gameId: game.id,
     color,
-    opponent: { username: opp.username },
+    opponent: { id: opp.userId, username: opp.username },
     fen: game.chess.fen(),
     turn: game.chess.turn() === "w" ? ("white" as const) : ("black" as const),
     vsBot: !!game.vsBot,

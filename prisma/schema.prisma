@@ -22,10 +22,33 @@ model User {
   // JSON array of opening IDs (e.g. ["sicilian","ruy_lopez"]). Empty = no preferences.
   preferredOpenings String @default("[]")
 
+  banned    Boolean   @default(false)
+  bannedAt  DateTime?
+  banReason String?
+
   createdAt    DateTime @default(now())
 
   whiteGames   Game[]   @relation("WhiteGames")
   blackGames   Game[]   @relation("BlackGames")
+  reportsMade     Report[] @relation("Reporter")
+  reportsReceived Report[] @relation("Reported")
+}
+
+model Report {
+  id          String   @id @default(cuid())
+  reporterId  String
+  reportedId  String
+  gameId      String?
+  reason      String   // nsfw | harassment | spam | nsfw_auto | other
+  note        String?
+  createdAt   DateTime @default(now())
+
+  reporter User @relation("Reporter", fields: [reporterId], references: [id])
+  reported User @relation("Reported", fields: [reportedId], references: [id])
+
+  @@unique([reporterId, reportedId, gameId])
+  @@index([reportedId])
+  @@index([createdAt])
 }
 
 model Game {

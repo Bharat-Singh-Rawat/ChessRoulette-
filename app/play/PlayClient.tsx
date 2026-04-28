@@ -5,6 +5,7 @@ import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
 import { io, Socket } from "socket.io-client";
 import { useWebRTC, type WebRTCStatus } from "./useWebRTC";
+import { useNSFWGuard, type NSFWStatus } from "./useNSFWGuard";
 
 type Phase = "idle" | "queueing" | "playing" | "over";
 type Color = "white" | "black";
@@ -13,7 +14,7 @@ type Clocks = { whiteMs: number; blackMs: number; lastUpdateAt: number };
 type GameInfo = {
   gameId: string;
   color: Color;
-  opponent: { username: string };
+  opponent: { id: string; username: string };
   fen: string;
   turn: Color;
   vsBot: boolean;
@@ -113,6 +114,50 @@ export default function PlayClient({
     enabled: (phase === "playing" || phase === "over") && !!game,
     localOnly: !!game?.vsBot,
   });
+
+  // NSFW guard: scan the opponent's remote stream. Auto-report on flag.
+  const [opponentVideoEl, setOpponentVideoEl] = useState<HTMLVideoElement | null>(null);
+  const [reportModalOpen, setReportModalOpen] = useState(false);
+  const [reportSent, setReportSent] = useState(false);
+  const nsfw = useNSFWGuard({
+    videoEl: opponentVideoEl,
+    enabled: !!webrtc.remoteStream && !game?.vsBot,
+    onFlag: () => {
+      if (!game) return;
+      void fetch("/api/reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          reportedUserId: game.opponent.id,
+          gameId: game.gameId,
+          reason: "nsfw_auto",
+        }),
+      });
+    },
+  });
+  const opponentHidden = nsfw.status === "flagged";
+
+  async function submitReport(reason: string, note?: string) {
+    if (!game) return;
+    setReportSent(false);
+    const r = await fetch("/api/reports", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        reportedUserId: game.opponent.id,
+        gameId: game.gameId,
+        reason,
+        note,
+      }),
+    });
+    if (r.ok) {
+      setReportSent(true);
+      setReportModalOpen(false);
+    } else {
+      const d = (await r.json().catch(() => ({}))) as { error?: string };
+      setNotice(d.error ?? "Report failed");
+    }
+  }
 
   function findMatch() {
     setNotice(null);
@@ -270,6 +315,9 @@ export default function PlayClient({
               error={webrtc.error}
               opponentName={game.opponent.username}
               vsBot={game.vsBot}
+              hidden={opponentHidden}
+              nsfwStatus={nsfw.status}
+              onVideoEl={setOpponentVideoEl}
             />
             <Panel>
               <div className="flex flex-col gap-3 text-sm">
@@ -312,7 +360,7 @@ export default function PlayClient({
                   />
                 )}
               </div>
-              <div className="mt-2 flex gap-2">
+              <div className="mt-2 flex flex-wrap gap-2">
                 {phase === "playing" && (
                   <button
                     type="button"
@@ -321,6 +369,20 @@ export default function PlayClient({
                   >
                     Resign
                   </button>
+                )}
+                {!game.vsBot && (phase === "playing" || phase === "over") && (
+                  <button
+                    type="button"
+                    onClick={() => setReportModalOpen(true)}
+                    className="rounded-md border border-zinc-300 bg-white px-3 py-1 text-sm text-zinc-700 hover:bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                  >
+                    Report opponent
+                  </button>
+                )}
+                {reportSent && (
+                  <span className="self-center text-xs text-emerald-600 dark:text-emerald-400">
+                    Report received.
+                  </span>
                 )}
                 {phase === "over" && (
                   <>
@@ -353,10 +415,97 @@ export default function PlayClient({
         </p>
       )}
 
+      {opponentHidden && (
+        <p className="rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900/50 dark:bg-red-950/40 dark:text-red-200">
+          Opponent video automatically hidden after flagged content was detected.
+          A report has been filed.
+        </p>
+      )}
+
       {/* Floating draggable self-cam — rendered outside the grid so it can move freely. */}
       {(phase === "playing" || phase === "over") && (
         <SelfVideoTile stream={webrtc.localStream} />
       )}
+
+      {reportModalOpen && (
+        <ReportModal
+          onCancel={() => setReportModalOpen(false)}
+          onSubmit={submitReport}
+        />
+      )}
+    </div>
+  );
+}
+
+function ReportModal({
+  onCancel,
+  onSubmit,
+}: {
+  onCancel: () => void;
+  onSubmit: (reason: string, note?: string) => void | Promise<void>;
+}) {
+  const [reason, setReason] = useState("nsfw");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
+      <div className="w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-800 dark:bg-zinc-950">
+        <h3 className="text-lg font-semibold">Report opponent</h3>
+        <p className="mt-1 text-sm text-zinc-500">
+          Auto-ban kicks in at 4 unique reports in 30 days. False reports may
+          result in your own account being limited.
+        </p>
+        <div className="mt-4 flex flex-col gap-2 text-sm">
+          {[
+            { v: "nsfw", l: "NSFW / inappropriate content" },
+            { v: "harassment", l: "Harassment or hateful behavior" },
+            { v: "spam", l: "Spam or bot account" },
+            { v: "other", l: "Other" },
+          ].map((o) => (
+            <label key={o.v} className="flex items-center gap-2">
+              <input
+                type="radio"
+                name="reason"
+                value={o.v}
+                checked={reason === o.v}
+                onChange={() => setReason(o.v)}
+              />
+              {o.l}
+            </label>
+          ))}
+        </div>
+        <textarea
+          placeholder="Optional note for moderators (max 500 chars)"
+          value={note}
+          maxLength={500}
+          onChange={(e) => setNote(e.target.value)}
+          className="mt-3 w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
+          rows={3}
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              await onSubmit(reason, note.trim() || undefined);
+              setBusy(false);
+            }}
+            className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+          >
+            {busy ? "Sending…" : "Submit report"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -544,17 +693,25 @@ function OpponentVideo({
   error,
   opponentName,
   vsBot,
+  hidden,
+  nsfwStatus,
+  onVideoEl,
 }: {
   stream: MediaStream | null;
   status: WebRTCStatus;
   error: string | null;
   opponentName: string;
   vsBot: boolean;
+  hidden: boolean;
+  nsfwStatus: NSFWStatus;
+  onVideoEl: (el: HTMLVideoElement | null) => void;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     if (ref.current) ref.current.srcObject = stream;
-  }, [stream]);
+    onVideoEl(ref.current);
+    return () => onVideoEl(null);
+  }, [stream, onVideoEl]);
 
   return (
     <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-zinc-200 bg-zinc-900 dark:border-zinc-800">
@@ -565,12 +722,23 @@ function OpponentVideo({
           <span className="text-xs text-zinc-500">Bots don&apos;t have webcams</span>
         </div>
       ) : stream ? (
-        <video
-          ref={ref}
-          autoPlay
-          playsInline
-          className="h-full w-full object-cover"
-        />
+        <>
+          <video
+            ref={ref}
+            autoPlay
+            playsInline
+            className={`h-full w-full object-cover ${hidden ? "invisible" : ""}`}
+          />
+          {hidden && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-zinc-900 text-center text-zinc-300">
+              <span className="text-3xl">🚫</span>
+              <span className="text-sm font-medium">Video hidden</span>
+              <span className="text-xs text-zinc-500">
+                Flagged as inappropriate
+              </span>
+            </div>
+          )}
+        </>
       ) : (
         <div className="flex h-full w-full flex-col items-center justify-center gap-1 text-center text-sm text-zinc-300">
           <span className="text-base font-medium">{opponentName}</span>
@@ -580,6 +748,16 @@ function OpponentVideo({
       <span className="absolute left-2 top-2 rounded-md bg-black/50 px-2 py-0.5 text-xs text-white backdrop-blur">
         {opponentName}
       </span>
+      {!vsBot && nsfwStatus === "watching" && stream && (
+        <span className="absolute right-2 top-2 rounded-md bg-emerald-600/80 px-2 py-0.5 text-[10px] uppercase tracking-wider text-white">
+          AI guard on
+        </span>
+      )}
+      {!vsBot && nsfwStatus === "loading_model" && stream && (
+        <span className="absolute right-2 top-2 rounded-md bg-zinc-700/80 px-2 py-0.5 text-[10px] uppercase tracking-wider text-white">
+          Loading guard…
+        </span>
+      )}
     </div>
   );
 }
