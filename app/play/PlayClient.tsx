@@ -8,6 +8,8 @@ import { useWebRTC, type WebRTCStatus } from "./useWebRTC";
 
 type Phase = "idle" | "queueing" | "playing" | "over";
 type Color = "white" | "black";
+type Mode = "casual" | "bullet";
+type Clocks = { whiteMs: number; blackMs: number; lastUpdateAt: number };
 type GameInfo = {
   gameId: string;
   color: Color;
@@ -15,12 +17,15 @@ type GameInfo = {
   fen: string;
   turn: Color;
   vsBot: boolean;
+  mode: Mode;
   matchedOpening: { id: string; name: string } | null;
+  clocks: Clocks | null;
 };
 type GameState = {
   fen: string;
   turn: Color;
   lastMove?: { from: string; to: string; san: string };
+  clocks?: Clocks | null;
 };
 type RatingChange = {
   white: number;
@@ -28,13 +33,21 @@ type RatingChange = {
   whiteRating: number;
   blackRating: number;
 };
+type TokenChange = { white: number; black: number };
 type GameResult = {
   winner: Color | null;
   reason: string;
   ratingChange?: RatingChange;
+  tokenChange?: TokenChange;
 };
 
-export default function PlayClient({ username }: { username: string }) {
+export default function PlayClient({
+  username,
+  initialTokens,
+}: {
+  username: string;
+  initialTokens: number;
+}) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [game, setGame] = useState<GameInfo | null>(null);
   const [state, setState] = useState<GameState | null>(null);
@@ -42,6 +55,7 @@ export default function PlayClient({ username }: { username: string }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [socket, setSocket] = useState<Socket | null>(null);
+  const [tokens, setTokens] = useState<number>(initialTokens);
   const socketRef = useRef<Socket | null>(null);
 
   useEffect(() => {
@@ -51,17 +65,35 @@ export default function PlayClient({ username }: { username: string }) {
     s.on("connect", () => setConnected(true));
     s.on("disconnect", () => setConnected(false));
     s.on("queue:waiting", () => setPhase("queueing"));
+    s.on(
+      "queue:rejected",
+      ({ message }: { reason: string; message: string }) => {
+        setNotice(message);
+        setPhase("idle");
+      },
+    );
     s.on("match:found", (info: GameInfo) => {
       setGame(info);
-      setState({ fen: info.fen, turn: info.turn });
+      setState({ fen: info.fen, turn: info.turn, clocks: info.clocks });
       setResult(null);
       setNotice(null);
       setPhase("playing");
+      // Optimistically debit a token client-side for casual matches; the
+      // canonical value is the next time the page reloads.
+      if (info.mode === "casual" && !info.vsBot) {
+        setTokens((t) => Math.max(0, t - 1));
+      }
     });
     s.on("game:state", (st: GameState) => setState(st));
     s.on("game:over", (r: GameResult) => {
       setResult(r);
       setPhase("over");
+      if (r.tokenChange) {
+        setTokens(
+          (t) =>
+            t + ((game?.color === "white" ? r.tokenChange!.white : r.tokenChange!.black) ?? 0),
+        );
+      }
     });
     s.on("game:opponent_disconnected", () =>
       setNotice("Opponent disconnected — they may rejoin."),
@@ -71,10 +103,9 @@ export default function PlayClient({ username }: { username: string }) {
     return () => {
       s.disconnect();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // White is the WebRTC initiator. Hook tears down between matches via gameId dep.
-  // In bot games, only the local camera turns on (no peer to connect to).
   const webrtc = useWebRTC({
     socket,
     gameId: phase === "playing" || phase === "over" ? game?.gameId ?? null : null,
@@ -88,18 +119,20 @@ export default function PlayClient({ username }: { username: string }) {
     setResult(null);
     socketRef.current?.emit("queue:join");
   }
-
+  function findBulletMatch() {
+    setNotice(null);
+    setResult(null);
+    socketRef.current?.emit("queue:join_bullet");
+  }
   function findBotMatch() {
     setNotice(null);
     setResult(null);
     socketRef.current?.emit("queue:join_bot");
   }
-
   function leaveQueue() {
     socketRef.current?.emit("queue:leave");
     setPhase("idle");
   }
-
   function resign() {
     if (game) socketRef.current?.emit("game:resign", { gameId: game.gameId });
   }
@@ -119,6 +152,7 @@ export default function PlayClient({ username }: { username: string }) {
       fen: local.fen(),
       turn: local.turn() === "w" ? "white" : "black",
       lastMove: { from: move.from, to: move.to, san: move.san },
+      clocks: state.clocks ?? null,
     });
     socketRef.current?.emit("game:move", {
       gameId: game.gameId,
@@ -127,6 +161,8 @@ export default function PlayClient({ username }: { username: string }) {
     });
     return true;
   }
+
+  const outOfTokens = tokens <= 0;
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-6 px-6 py-12">
@@ -141,24 +177,37 @@ export default function PlayClient({ username }: { username: string }) {
           <span className={connected ? "text-emerald-600" : "text-amber-600"}>
             {connected ? "connected" : "connecting…"}
           </span>
+          {" · "}
+          <span className="font-medium text-zinc-700 dark:text-zinc-300">
+            🪙 {tokens} tokens
+          </span>
         </p>
       </header>
 
       {phase === "idle" && (
         <Panel>
           <p className="text-sm text-zinc-600 dark:text-zinc-400">
-            Pair with a real player (FIFO matchmaking) or jump straight into a
-            practice game vs a computer opponent. Either way the browser will ask
-            for your camera and mic — you can deny and still play.
+            <strong>Casual</strong> matches cost 1 token and update your rating.
+            <strong> Bullet</strong> matches are free, fast (60s per side), and
+            winning earns you 10 tokens. <strong>Practice</strong> vs the
+            computer is always free but doesn&apos;t affect your rating.
           </p>
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
               onClick={findMatch}
-              disabled={!connected}
+              disabled={!connected || outOfTokens}
               className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
             >
-              Find a match
+              Casual match (1 token)
+            </button>
+            <button
+              type="button"
+              onClick={findBulletMatch}
+              disabled={!connected}
+              className="rounded-md border border-emerald-300 bg-emerald-50 px-4 py-2 text-sm font-medium text-emerald-900 transition-colors hover:bg-emerald-100 disabled:opacity-50 dark:border-emerald-800/50 dark:bg-emerald-950/40 dark:text-emerald-200 dark:hover:bg-emerald-950/60"
+            >
+              Bullet match (free, win 10 tokens)
             </button>
             <button
               type="button"
@@ -169,6 +218,12 @@ export default function PlayClient({ username }: { username: string }) {
               Practice vs computer
             </button>
           </div>
+          {outOfTokens && (
+            <p className="text-xs text-amber-700 dark:text-amber-300">
+              Out of tokens — win a bullet game to earn 10 and unlock casual
+              matches.
+            </p>
+          )}
         </Panel>
       )}
 
@@ -198,6 +253,14 @@ export default function PlayClient({ username }: { username: string }) {
                 id: "live-board",
               }}
             />
+            {game.mode === "bullet" && state.clocks && (
+              <ClockBar
+                clocks={state.clocks}
+                turn={state.turn}
+                youColor={game.color}
+                gameOver={phase === "over"}
+              />
+            )}
           </div>
 
           <div className="flex flex-col gap-4">
@@ -210,6 +273,7 @@ export default function PlayClient({ username }: { username: string }) {
             />
             <Panel>
               <div className="flex flex-col gap-3 text-sm">
+                <Row label="Mode" value={game.mode === "bullet" ? "Bullet (1 min)" : game.vsBot ? "Practice" : "Casual"} />
                 <Row label="You" value={`${username} (${game.color})`} />
                 <Row label="Opponent" value={game.opponent.username} />
                 {game.matchedOpening && (
@@ -241,6 +305,12 @@ export default function PlayClient({ username }: { username: string }) {
                     value={ratingLine(result.ratingChange, game.color)}
                   />
                 )}
+                {result?.tokenChange && (
+                  <Row
+                    label="Tokens"
+                    value={tokenLine(result.tokenChange, game.color)}
+                  />
+                )}
               </div>
               <div className="mt-2 flex gap-2">
                 {phase === "playing" && (
@@ -253,13 +323,23 @@ export default function PlayClient({ username }: { username: string }) {
                   </button>
                 )}
                 {phase === "over" && (
-                  <button
-                    type="button"
-                    onClick={findMatch}
-                    className="rounded-md bg-zinc-900 px-3 py-1 text-sm text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
-                  >
-                    Find another match
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      onClick={findMatch}
+                      disabled={outOfTokens}
+                      className="rounded-md bg-zinc-900 px-3 py-1 text-sm text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+                    >
+                      Casual again
+                    </button>
+                    <button
+                      type="button"
+                      onClick={findBulletMatch}
+                      className="rounded-md border border-emerald-300 bg-emerald-50 px-3 py-1 text-sm text-emerald-800 hover:bg-emerald-100 dark:border-emerald-800/50 dark:bg-emerald-950/40 dark:text-emerald-200"
+                    >
+                      Bullet again
+                    </button>
+                  </>
                 )}
               </div>
             </Panel>
@@ -292,6 +372,72 @@ function ratingLine(rc: RatingChange, you: Color): string {
   const newRating = you === "white" ? rc.whiteRating : rc.blackRating;
   const sign = delta > 0 ? "+" : "";
   return `${newRating} (${sign}${delta})`;
+}
+
+function tokenLine(tc: TokenChange, you: Color): string {
+  const delta = you === "white" ? tc.white : tc.black;
+  if (delta === 0) return "no change";
+  return `+${delta}`;
+}
+
+function ClockBar({
+  clocks,
+  turn,
+  youColor,
+  gameOver,
+}: {
+  clocks: Clocks;
+  turn: Color;
+  youColor: Color;
+  gameOver: boolean;
+}) {
+  // Tick every 100ms to update the active clock visually; server is authoritative.
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (gameOver) return;
+    const id = setInterval(() => setTick((n) => n + 1), 100);
+    return () => clearInterval(id);
+  }, [gameOver]);
+  // Rebase: subtract elapsed since clocks.lastUpdateAt from the active side.
+  const now = Date.now();
+  const elapsed = gameOver ? 0 : now - clocks.lastUpdateAt;
+  const whiteMs = turn === "white" ? Math.max(0, clocks.whiteMs - elapsed) : clocks.whiteMs;
+  const blackMs = turn === "black" ? Math.max(0, clocks.blackMs - elapsed) : clocks.blackMs;
+  // Force a recalc when tick changes (variable used so eslint doesn't complain).
+  void tick;
+
+  const yourMs = youColor === "white" ? whiteMs : blackMs;
+  const oppMs = youColor === "white" ? blackMs : whiteMs;
+
+  return (
+    <div className="mt-3 flex items-center justify-between gap-2 text-sm">
+      <ClockChip label="Opponent" ms={oppMs} active={!gameOver && turn !== youColor} />
+      <ClockChip label="You" ms={yourMs} active={!gameOver && turn === youColor} />
+    </div>
+  );
+}
+
+function ClockChip({ label, ms, active }: { label: string; ms: number; active: boolean }) {
+  const totalSec = Math.ceil(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  const danger = ms <= 10_000;
+  return (
+    <div
+      className={`flex flex-1 flex-col items-center rounded-md border px-3 py-2 ${
+        active
+          ? danger
+            ? "border-red-500 bg-red-100 text-red-900 dark:border-red-700 dark:bg-red-950/40 dark:text-red-200"
+            : "border-emerald-400 bg-emerald-50 text-emerald-900 dark:border-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200"
+          : "border-zinc-200 bg-white text-zinc-700 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-300"
+      }`}
+    >
+      <span className="text-[10px] uppercase tracking-wider opacity-70">{label}</span>
+      <span className="font-mono text-xl tabular-nums">
+        {m}:{s.toString().padStart(2, "0")}
+      </span>
+    </div>
+  );
 }
 
 function Panel({ children }: { children: React.ReactNode }) {
@@ -334,14 +480,12 @@ function clampToViewport(left: number, top: number) {
 
 function SelfVideoTile({ stream }: { stream: MediaStream | null }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  // Position in viewport pixels. null = use the default bottom-right anchor.
   const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.srcObject = stream;
   }, [stream]);
 
-  // Re-clamp on viewport resize so the tile doesn't end up off-screen.
   useEffect(() => {
     function onResize() {
       setPos((p) => (p ? clampToViewport(p.left, p.top) : p));
@@ -418,7 +562,7 @@ function OpponentVideo({
         <div className="flex h-full w-full flex-col items-center justify-center gap-2 text-center text-zinc-300">
           <span className="text-5xl">🤖</span>
           <span className="text-base font-medium">{opponentName}</span>
-          <span className="text-xs text-zinc-500">Bots don't have webcams</span>
+          <span className="text-xs text-zinc-500">Bots don&apos;t have webcams</span>
         </div>
       ) : stream ? (
         <video

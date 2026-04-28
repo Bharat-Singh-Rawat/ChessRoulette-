@@ -3,27 +3,38 @@ import type { Server, Socket } from "socket.io";
 import { prisma } from "./db";
 import { computeNewRatings, type EloOutcome } from "./elo";
 import { parsePreferences, nameForId } from "./openings";
+import {
+  TOKENS_PER_CASUAL_MATCH,
+  TOKENS_FOR_BULLET_WIN,
+  BULLET_TIME_MS,
+} from "./economy";
 
 type Color = "white" | "black";
+type Mode = "casual" | "bullet";
 type Side = {
   userId: string;
   username: string;
   socketId: string;
   preferences: string[];
 };
+type Clocks = { whiteMs: number; blackMs: number; lastUpdateAt: number };
 type Game = {
   id: string;
+  mode: Mode;
   white: Side;
   black: Side;
   chess: Chess;
   status: "in_progress" | "finished";
   startedAt: Date;
   vsBot?: boolean;
-  matchedOpening?: string; // opening id, if pair shares one
+  matchedOpening?: string;
+  clocks?: Clocks;
+  flagTimer?: NodeJS.Timeout;
 };
 
 const games = new Map<string, Game>();
-const queue: Side[] = [];
+const casualQueue: Side[] = [];
+const bulletQueue: Side[] = [];
 const userToGame = new Map<string, string>();
 
 const BOT_USER_ID = "bot:random";
@@ -35,11 +46,74 @@ function colorFor(game: Game, userId: string): Color | null {
   return null;
 }
 
-function pushGameState(io: Server, game: Game, lastMove?: { from: string; to: string; san: string }) {
+// --- Clocks --------------------------------------------------------------
+function snapshotClocks(game: Game): Clocks | null {
+  if (!game.clocks) return null;
+  // Return a snapshot with active-player time decremented by elapsed since last update.
+  const now = Date.now();
+  const elapsed = now - game.clocks.lastUpdateAt;
+  const turn = game.chess.turn() === "w" ? "white" : "black";
+  return {
+    whiteMs: turn === "white" ? Math.max(0, game.clocks.whiteMs - elapsed) : game.clocks.whiteMs,
+    blackMs: turn === "black" ? Math.max(0, game.clocks.blackMs - elapsed) : game.clocks.blackMs,
+    lastUpdateAt: now,
+  };
+}
+
+function applyClockOnMove(game: Game): boolean {
+  // Returns true if active player still has time, false if they flagged.
+  if (!game.clocks) return true;
+  const now = Date.now();
+  const elapsed = now - game.clocks.lastUpdateAt;
+  const turnBeforeMove = game.chess.history().length % 2 === 0 ? "white" : "black";
+  // turnBeforeMove is whoever was on move *before* the move was applied. But we
+  // call this AFTER game.chess.move(...), so chess.turn() is now the OTHER side.
+  // Easier: use the inverse of current turn.
+  const moverColor = game.chess.turn() === "w" ? "black" : "white";
+  const moverKey = moverColor === "white" ? "whiteMs" : "blackMs";
+  game.clocks[moverKey] = Math.max(0, game.clocks[moverKey] - elapsed);
+  game.clocks.lastUpdateAt = now;
+  return game.clocks[moverKey] > 0;
+}
+
+function scheduleFlagFall(io: Server, game: Game) {
+  if (game.flagTimer) {
+    clearTimeout(game.flagTimer);
+    game.flagTimer = undefined;
+  }
+  if (!game.clocks || game.status !== "in_progress") return;
+  const turn = game.chess.turn() === "w" ? "white" : "black";
+  const remaining = turn === "white" ? game.clocks.whiteMs : game.clocks.blackMs;
+  game.flagTimer = setTimeout(() => {
+    if (game.status !== "in_progress" || !game.clocks) return;
+    const now = Date.now();
+    const t = game.chess.turn() === "w" ? "white" : "black";
+    const r =
+      (t === "white" ? game.clocks.whiteMs : game.clocks.blackMs) -
+      (now - game.clocks.lastUpdateAt);
+    if (r <= 0) {
+      finalize(io, game, {
+        winner: t === "white" ? "black" : "white",
+        reason: "time",
+      });
+    } else {
+      // Race: not flagged yet, reschedule.
+      scheduleFlagFall(io, game);
+    }
+  }, remaining + 50);
+}
+
+// --- Broadcasting --------------------------------------------------------
+function pushGameState(
+  io: Server,
+  game: Game,
+  lastMove?: { from: string; to: string; san: string },
+) {
   io.to(game.id).emit("game:state", {
     fen: game.chess.fen(),
     turn: game.chess.turn() === "w" ? "white" : "black",
     lastMove,
+    clocks: snapshotClocks(game),
   });
 }
 
@@ -52,9 +126,11 @@ function matchFoundPayload(game: Game, color: Color) {
     fen: game.chess.fen(),
     turn: game.chess.turn() === "w" ? ("white" as const) : ("black" as const),
     vsBot: !!game.vsBot,
+    mode: game.mode,
     matchedOpening: game.matchedOpening
       ? { id: game.matchedOpening, name: nameForId(game.matchedOpening) }
       : null,
+    clocks: snapshotClocks(game),
   };
 }
 
@@ -72,38 +148,35 @@ function detectGameOver(game: Game): { winner: Color | null; reason: string } | 
 function finalize(io: Server, game: Game, result: { winner: Color | null; reason: string }) {
   if (game.status === "finished") return;
   game.status = "finished";
+  if (game.flagTimer) {
+    clearTimeout(game.flagTimer);
+    game.flagTimer = undefined;
+  }
 
-  // Schedule cleanup regardless of how DB persistence goes.
   setTimeout(() => {
     userToGame.delete(game.white.userId);
     userToGame.delete(game.black.userId);
     games.delete(game.id);
   }, 60_000);
 
-  // Bot games don't affect ratings or get persisted.
   if (game.vsBot) {
     io.to(game.id).emit("game:over", result);
     return;
   }
 
-  // Persist + update ratings, then broadcast with the rating delta.
   void (async () => {
     try {
       const outcome: EloOutcome =
-        result.winner === "white"
-          ? "white_wins"
-          : result.winner === "black"
-            ? "black_wins"
-            : "draw";
+        result.winner === "white" ? "white_wins" : result.winner === "black" ? "black_wins" : "draw";
 
       const [whiteUser, blackUser] = await Promise.all([
         prisma.user.findUnique({
           where: { id: game.white.userId },
-          select: { rating: true },
+          select: { rating: true, tokens: true },
         }),
         prisma.user.findUnique({
           where: { id: game.black.userId },
-          select: { rating: true },
+          select: { rating: true, tokens: true },
         }),
       ]);
       if (!whiteUser || !blackUser) {
@@ -117,6 +190,10 @@ function finalize(io: Server, game: Game, result: { winner: Color | null; reason
       const blackWon = result.winner === "black";
       const drew = result.winner === null;
 
+      // Bullet bonus for the winner only (no bonus on draws).
+      const bulletBonusWhite = game.mode === "bullet" && whiteWon ? TOKENS_FOR_BULLET_WIN : 0;
+      const bulletBonusBlack = game.mode === "bullet" && blackWon ? TOKENS_FOR_BULLET_WIN : 0;
+
       await prisma.$transaction([
         prisma.user.update({
           where: { id: game.white.userId },
@@ -125,6 +202,7 @@ function finalize(io: Server, game: Game, result: { winner: Color | null; reason
             wins: { increment: whiteWon ? 1 : 0 },
             losses: { increment: blackWon ? 1 : 0 },
             draws: { increment: drew ? 1 : 0 },
+            tokens: { increment: bulletBonusWhite },
           },
         }),
         prisma.user.update({
@@ -134,6 +212,7 @@ function finalize(io: Server, game: Game, result: { winner: Color | null; reason
             wins: { increment: blackWon ? 1 : 0 },
             losses: { increment: whiteWon ? 1 : 0 },
             draws: { increment: drew ? 1 : 0 },
+            tokens: { increment: bulletBonusBlack },
           },
         }),
         prisma.game.create({
@@ -158,9 +237,13 @@ function finalize(io: Server, game: Game, result: { winner: Color | null; reason
           whiteRating: r.whiteRating,
           blackRating: r.blackRating,
         },
+        tokenChange: {
+          white: bulletBonusWhite,
+          black: bulletBonusBlack,
+        },
       });
     } catch (err) {
-      console.error("[games] rating update failed", err);
+      console.error("[games] rating/token update failed", err);
       io.to(game.id).emit("game:over", result);
     }
   })();
@@ -170,7 +253,6 @@ function finalize(io: Server, game: Game, result: { winner: Color | null; reason
 function pickBotMove(chess: Chess): { from: string; to: string; promotion?: string } | null {
   const moves = chess.moves({ verbose: true });
   if (!moves.length) return null;
-  // Slightly biased random: prefer captures and checks over plain moves.
   const score = (m: (typeof moves)[number]) =>
     (m.captured ? 5 : 0) + (m.flags.includes("p") ? 2 : 0) + Math.random();
   moves.sort((a, b) => score(b) - score(a));
@@ -200,40 +282,115 @@ function maybeBotMove(io: Server, game: Game) {
 
 // ------------------------------------------------------------------------
 
+async function loadPreferences(userId: string): Promise<string[]> {
+  const row = await prisma.user
+    .findUnique({ where: { id: userId }, select: { preferredOpenings: true } })
+    .catch(() => null);
+  return parsePreferences(row?.preferredOpenings);
+}
+
+function startMatch(
+  io: Server,
+  newcomer: Side,
+  partner: Side,
+  mode: Mode,
+  matchedOpening: string | undefined,
+): Game {
+  const newcomerIsWhite = Math.random() < 0.5;
+  const white = newcomerIsWhite ? newcomer : partner;
+  const black = newcomerIsWhite ? partner : newcomer;
+  const gameId = `g_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const game: Game = {
+    id: gameId,
+    mode,
+    white,
+    black,
+    chess: new Chess(),
+    status: "in_progress",
+    startedAt: new Date(),
+    matchedOpening,
+  };
+  if (mode === "bullet") {
+    game.clocks = {
+      whiteMs: BULLET_TIME_MS,
+      blackMs: BULLET_TIME_MS,
+      lastUpdateAt: Date.now(),
+    };
+    scheduleFlagFall(io, game);
+  }
+  games.set(gameId, game);
+  userToGame.set(white.userId, gameId);
+  userToGame.set(black.userId, gameId);
+
+  const whiteSock = io.sockets.sockets.get(white.socketId);
+  const blackSock = io.sockets.sockets.get(black.socketId);
+  whiteSock?.join(gameId);
+  blackSock?.join(gameId);
+
+  whiteSock?.emit("match:found", matchFoundPayload(game, "white"));
+  blackSock?.emit("match:found", matchFoundPayload(game, "black"));
+
+  return game;
+}
+
+function debitCasualTokens(game: Game) {
+  if (game.mode !== "casual" || game.vsBot) return;
+  void prisma
+    .$transaction([
+      prisma.user.update({
+        where: { id: game.white.userId },
+        data: { tokens: { decrement: TOKENS_PER_CASUAL_MATCH } },
+      }),
+      prisma.user.update({
+        where: { id: game.black.userId },
+        data: { tokens: { decrement: TOKENS_PER_CASUAL_MATCH } },
+      }),
+    ])
+    .catch((err) => console.error("[games] token debit failed", err));
+}
+
 export function handleConnection(io: Server, socket: Socket) {
   const user = socket.data.user as { id: string; username: string };
 
-  socket.on("queue:join", async () => {
-    // If user already has an active game, resume it
+  function resumeIfActive(): boolean {
     const existingGameId = userToGame.get(user.id);
     const existing = existingGameId ? games.get(existingGameId) : null;
     if (existing && existing.status === "in_progress") {
       const youAre = colorFor(existing, user.id);
-      if (!youAre) return;
+      if (!youAre) return false;
       if (youAre === "white") existing.white.socketId = socket.id;
       else existing.black.socketId = socket.id;
       socket.join(existing.id);
       socket.emit("match:found", matchFoundPayload(existing, youAre));
-      return;
+      return true;
     }
+    return false;
+  }
+
+  socket.on("queue:join", async () => {
+    if (resumeIfActive()) return;
 
     // Already queued?
-    const existingIdx = queue.findIndex((q) => q.userId === user.id);
-    if (existingIdx >= 0) {
-      queue[existingIdx].socketId = socket.id;
-      socket.emit("queue:waiting", { position: existingIdx + 1 });
+    const idx = casualQueue.findIndex((q) => q.userId === user.id);
+    if (idx >= 0) {
+      casualQueue[idx].socketId = socket.id;
+      socket.emit("queue:waiting", { position: idx + 1 });
       return;
     }
 
-    // Load user's preferences from the DB.
-    const prefRow = await prisma.user
-      .findUnique({
-        where: { id: user.id },
-        select: { preferredOpenings: true },
-      })
+    // Token check
+    const u = await prisma.user
+      .findUnique({ where: { id: user.id }, select: { tokens: true } })
       .catch(() => null);
-    const preferences = parsePreferences(prefRow?.preferredOpenings);
+    if (!u || u.tokens < TOKENS_PER_CASUAL_MATCH) {
+      socket.emit("queue:rejected", {
+        reason: "out_of_tokens",
+        message: "Out of tokens. Win a bullet game to earn 10.",
+      });
+      return;
+    }
 
+    const preferences = await loadPreferences(user.id);
     const newcomer: Side = {
       userId: user.id,
       username: user.username,
@@ -241,77 +398,65 @@ export function handleConnection(io: Server, socket: Socket) {
       preferences,
     };
 
-    // Find a partner: prefer overlap with newcomer, else oldest in queue.
     let partnerIdx = -1;
     if (preferences.length > 0) {
-      partnerIdx = queue.findIndex((q) =>
+      partnerIdx = casualQueue.findIndex((q) =>
         q.preferences.some((p) => preferences.includes(p)),
       );
     }
-    if (partnerIdx === -1 && queue.length > 0) {
-      // Or maybe the queued player has prefs that match the newcomer (catch the
-      // case where newcomer has no prefs but queued does — we'd still want them
-      // paired even though there's no "overlap").
-      partnerIdx = 0;
-    }
+    if (partnerIdx === -1 && casualQueue.length > 0) partnerIdx = 0;
 
     if (partnerIdx >= 0) {
-      const partner = queue.splice(partnerIdx, 1)[0]!;
-      const newcomerIsWhite = Math.random() < 0.5;
-      const white = newcomerIsWhite ? newcomer : partner;
-      const black = newcomerIsWhite ? partner : newcomer;
-      const overlap = newcomer.preferences.find((p) =>
-        partner.preferences.includes(p),
-      );
-      const gameId = `g_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      const game: Game = {
-        id: gameId,
-        white,
-        black,
-        chess: new Chess(),
-        status: "in_progress",
-        startedAt: new Date(),
-        matchedOpening: overlap,
-      };
-      games.set(gameId, game);
-      userToGame.set(white.userId, gameId);
-      userToGame.set(black.userId, gameId);
-
-      const whiteSock = io.sockets.sockets.get(white.socketId);
-      const blackSock = io.sockets.sockets.get(black.socketId);
-      whiteSock?.join(gameId);
-      blackSock?.join(gameId);
-
-      whiteSock?.emit("match:found", matchFoundPayload(game, "white"));
-      blackSock?.emit("match:found", matchFoundPayload(game, "black"));
+      const partner = casualQueue.splice(partnerIdx, 1)[0]!;
+      const overlap = newcomer.preferences.find((p) => partner.preferences.includes(p));
+      const game = startMatch(io, newcomer, partner, "casual", overlap);
+      debitCasualTokens(game);
     } else {
-      queue.push(newcomer);
-      socket.emit("queue:waiting", { position: queue.length });
+      casualQueue.push(newcomer);
+      socket.emit("queue:waiting", { position: casualQueue.length });
+    }
+  });
+
+  socket.on("queue:join_bullet", () => {
+    if (resumeIfActive()) return;
+
+    const idx = bulletQueue.findIndex((q) => q.userId === user.id);
+    if (idx >= 0) {
+      bulletQueue[idx].socketId = socket.id;
+      socket.emit("queue:waiting", { position: idx + 1 });
+      return;
+    }
+
+    const newcomer: Side = {
+      userId: user.id,
+      username: user.username,
+      socketId: socket.id,
+      preferences: [],
+    };
+
+    if (bulletQueue.length > 0) {
+      const partner = bulletQueue.shift()!;
+      startMatch(io, newcomer, partner, "bullet", undefined);
+    } else {
+      bulletQueue.push(newcomer);
+      socket.emit("queue:waiting", { position: bulletQueue.length });
     }
   });
 
   socket.on("queue:leave", () => {
-    const i = queue.findIndex((q) => q.userId === user.id);
-    if (i >= 0) queue.splice(i, 1);
+    for (const q of [casualQueue, bulletQueue]) {
+      const i = q.findIndex((x) => x.userId === user.id);
+      if (i >= 0) q.splice(i, 1);
+    }
   });
 
   socket.on("queue:join_bot", () => {
-    // If user already has an active game, just resume it instead of starting a new one.
-    const existingGameId = userToGame.get(user.id);
-    const existing = existingGameId ? games.get(existingGameId) : null;
-    if (existing && existing.status === "in_progress") {
-      const youAre = colorFor(existing, user.id);
-      if (!youAre) return;
-      if (youAre === "white") existing.white.socketId = socket.id;
-      else existing.black.socketId = socket.id;
-      socket.join(existing.id);
-      socket.emit("match:found", matchFoundPayload(existing, youAre));
-      return;
+    if (resumeIfActive()) return;
+    socket.emit("queue:leave"); // also drop from real queues if waiting
+    for (const q of [casualQueue, bulletQueue]) {
+      const i = q.findIndex((x) => x.userId === user.id);
+      if (i >= 0) q.splice(i, 1);
     }
-
-    // Drop from queue if waiting.
-    const qi = queue.findIndex((q) => q.userId === user.id);
-    if (qi >= 0) queue.splice(qi, 1);
 
     const humanIsWhite = Math.random() < 0.5;
     const human: Side = { userId: user.id, username: user.username, socketId: socket.id, preferences: [] };
@@ -319,12 +464,12 @@ export function handleConnection(io: Server, socket: Socket) {
     const white = humanIsWhite ? human : bot;
     const black = humanIsWhite ? bot : human;
     const gameId = `g_bot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const chess = new Chess();
     const game: Game = {
       id: gameId,
+      mode: "casual",
       white,
       black,
-      chess,
+      chess: new Chess(),
       status: "in_progress",
       startedAt: new Date(),
       vsBot: true,
@@ -333,8 +478,6 @@ export function handleConnection(io: Server, socket: Socket) {
     userToGame.set(user.id, gameId);
     socket.join(gameId);
     socket.emit("match:found", matchFoundPayload(game, humanIsWhite ? "white" : "black"));
-
-    // If bot is white, it moves first.
     maybeBotMove(io, game);
   });
 
@@ -363,6 +506,16 @@ export function handleConnection(io: Server, socket: Socket) {
       }
       if (!move) return socket.emit("error", { message: "Invalid move" });
 
+      // Update clocks for bullet, then check flag fall
+      if (game.mode === "bullet") {
+        const stillHasTime = applyClockOnMove(game);
+        if (!stillHasTime) {
+          // Mover ran out of time as their move arrived. Treat as time loss.
+          finalize(io, game, { winner: youAre === "white" ? "black" : "white", reason: "time" });
+          return;
+        }
+      }
+
       pushGameState(io, game, { from: move.from, to: move.to, san: move.san });
 
       const over = detectGameOver(game);
@@ -371,7 +524,7 @@ export function handleConnection(io: Server, socket: Socket) {
         return;
       }
 
-      // If playing a bot, schedule the bot's reply.
+      if (game.mode === "bullet") scheduleFlagFall(io, game);
       maybeBotMove(io, game);
     },
   );
@@ -388,13 +541,10 @@ export function handleConnection(io: Server, socket: Socket) {
   });
 
   // --- WebRTC signaling relay --------------------------------------------
-  // We don't inspect payloads — just forward to the other peer in the room.
-  // Authorization comes from the socket already being authed and the gameId
-  // belonging to the user (verified before relay).
   function relayIfInGame(gameId: string, event: string, payload: unknown) {
     const game = games.get(gameId);
     if (!game || game.status !== "in_progress") return;
-    if (game.vsBot) return; // bot has no peer to receive
+    if (game.vsBot) return;
     if (!colorFor(game, user.id)) return;
     socket.to(gameId).emit(event, payload);
   }
@@ -410,8 +560,10 @@ export function handleConnection(io: Server, socket: Socket) {
   );
 
   socket.on("disconnect", () => {
-    const i = queue.findIndex((q) => q.userId === user.id);
-    if (i >= 0) queue.splice(i, 1);
+    for (const q of [casualQueue, bulletQueue]) {
+      const i = q.findIndex((x) => x.userId === user.id);
+      if (i >= 0) q.splice(i, 1);
+    }
     const gameId = userToGame.get(user.id);
     if (gameId) {
       const game = games.get(gameId);
@@ -422,4 +574,4 @@ export function handleConnection(io: Server, socket: Socket) {
   });
 }
 
-export const __debug = { games, queue, userToGame };
+export const __debug = { games, casualQueue, bulletQueue, userToGame };
