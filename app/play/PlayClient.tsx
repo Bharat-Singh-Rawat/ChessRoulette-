@@ -21,7 +21,17 @@ type GameState = {
   turn: Color;
   lastMove?: { from: string; to: string; san: string };
 };
-type GameResult = { winner: Color | null; reason: string };
+type RatingChange = {
+  white: number;
+  black: number;
+  whiteRating: number;
+  blackRating: number;
+};
+type GameResult = {
+  winner: Color | null;
+  reason: string;
+  ratingChange?: RatingChange;
+};
 
 export default function PlayClient({ username }: { username: string }) {
   const [phase, setPhase] = useState<Phase>("idle");
@@ -221,6 +231,12 @@ export default function PlayClient({ username }: { username: string }) {
                     emphasize
                   />
                 )}
+                {result?.ratingChange && (
+                  <Row
+                    label="Rating"
+                    value={ratingLine(result.ratingChange, game.color)}
+                  />
+                )}
               </div>
               <div className="mt-2 flex gap-2">
                 {phase === "playing" && (
@@ -265,6 +281,13 @@ function describeResult(r: GameResult, you: Color): string {
   if (r.winner === null) return `Draw (${r.reason.replaceAll("_", " ")})`;
   if (r.winner === you) return `You won (${r.reason})`;
   return `You lost (${r.reason})`;
+}
+
+function ratingLine(rc: RatingChange, you: Color): string {
+  const delta = you === "white" ? rc.white : rc.black;
+  const newRating = you === "white" ? rc.whiteRating : rc.blackRating;
+  const sign = delta > 0 ? "+" : "";
+  return `${newRating} (${sign}${delta})`;
 }
 
 function Panel({ children }: { children: React.ReactNode }) {

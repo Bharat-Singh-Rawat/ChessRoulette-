@@ -20,4 +20,27 @@ model User {
   tokens       Int      @default(50)
 
   createdAt    DateTime @default(now())
+
+  whiteGames   Game[]   @relation("WhiteGames")
+  blackGames   Game[]   @relation("BlackGames")
+}
+
+model Game {
+  id                 String   @id @default(cuid())
+  whiteId            String
+  blackId            String
+  result             String   // "white_wins" | "black_wins" | "draw"
+  reason             String   // checkmate | stalemate | resignation | ...
+  whiteRatingBefore  Int
+  blackRatingBefore  Int
+  whiteRatingAfter   Int
+  blackRatingAfter   Int
+  finishedAt         DateTime @default(now())
+
+  white User @relation("WhiteGames", fields: [whiteId], references: [id])
+  black User @relation("BlackGames", fields: [blackId], references: [id])
+
+  @@index([finishedAt])
+  @@index([whiteId])
+  @@index([blackId])
 }

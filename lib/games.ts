@@ -1,5 +1,7 @@
 import { Chess } from "chess.js";
 import type { Server, Socket } from "socket.io";
+import { prisma } from "./db";
+import { computeNewRatings, type EloOutcome } from "./elo";
 
 type Color = "white" | "black";
 type Side = { userId: string; username: string; socketId: string };
@@ -58,13 +60,100 @@ function detectGameOver(game: Game): { winner: Color | null; reason: string } | 
 }
 
 function finalize(io: Server, game: Game, result: { winner: Color | null; reason: string }) {
+  if (game.status === "finished") return;
   game.status = "finished";
-  io.to(game.id).emit("game:over", result);
+
+  // Schedule cleanup regardless of how DB persistence goes.
   setTimeout(() => {
     userToGame.delete(game.white.userId);
     userToGame.delete(game.black.userId);
     games.delete(game.id);
   }, 60_000);
+
+  // Bot games don't affect ratings or get persisted.
+  if (game.vsBot) {
+    io.to(game.id).emit("game:over", result);
+    return;
+  }
+
+  // Persist + update ratings, then broadcast with the rating delta.
+  void (async () => {
+    try {
+      const outcome: EloOutcome =
+        result.winner === "white"
+          ? "white_wins"
+          : result.winner === "black"
+            ? "black_wins"
+            : "draw";
+
+      const [whiteUser, blackUser] = await Promise.all([
+        prisma.user.findUnique({
+          where: { id: game.white.userId },
+          select: { rating: true },
+        }),
+        prisma.user.findUnique({
+          where: { id: game.black.userId },
+          select: { rating: true },
+        }),
+      ]);
+      if (!whiteUser || !blackUser) {
+        io.to(game.id).emit("game:over", result);
+        return;
+      }
+
+      const r = computeNewRatings(whiteUser.rating, blackUser.rating, outcome);
+
+      const whiteWon = result.winner === "white";
+      const blackWon = result.winner === "black";
+      const drew = result.winner === null;
+
+      await prisma.$transaction([
+        prisma.user.update({
+          where: { id: game.white.userId },
+          data: {
+            rating: r.whiteRating,
+            wins: { increment: whiteWon ? 1 : 0 },
+            losses: { increment: blackWon ? 1 : 0 },
+            draws: { increment: drew ? 1 : 0 },
+          },
+        }),
+        prisma.user.update({
+          where: { id: game.black.userId },
+          data: {
+            rating: r.blackRating,
+            wins: { increment: blackWon ? 1 : 0 },
+            losses: { increment: whiteWon ? 1 : 0 },
+            draws: { increment: drew ? 1 : 0 },
+          },
+        }),
+        prisma.game.create({
+          data: {
+            whiteId: game.white.userId,
+            blackId: game.black.userId,
+            result: outcome,
+            reason: result.reason,
+            whiteRatingBefore: whiteUser.rating,
+            blackRatingBefore: blackUser.rating,
+            whiteRatingAfter: r.whiteRating,
+            blackRatingAfter: r.blackRating,
+          },
+        }),
+      ]);
+
+      io.to(game.id).emit("game:over", {
+        ...result,
+        ratingChange: {
+          white: r.whiteDelta,
+          black: r.blackDelta,
+          whiteRating: r.whiteRating,
+          blackRating: r.blackRating,
+        },
+      });
+    } catch (err) {
+      console.error("[games] rating update failed", err);
+      io.to(game.id).emit("game:over", result);
+    }
+  })();
 }
 
 // --- Bot ----------------------------------------------------------------

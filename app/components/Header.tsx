@@ -12,6 +12,12 @@ export default async function Header() {
           ChessRoulette
         </Link>
         <nav className="flex items-center gap-3 text-sm">
+          <Link
+            href="/leaderboard"
+            className="text-zinc-700 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100"
+          >
+            Leaderboard
+          </Link>
           {session?.user ? (
             <>
               <Link
