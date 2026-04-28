@@ -176,7 +176,7 @@ export default function PlayClient({ username }: { username: string }) {
 
       {(phase === "playing" || phase === "over") && game && state && (
         <div className="grid gap-6 lg:grid-cols-[480px_1fr]">
-          <div className="relative w-full max-w-[480px]">
+          <div className="w-full max-w-[480px]">
             <Chessboard
               options={{
                 position: state.fen,
@@ -187,7 +187,6 @@ export default function PlayClient({ username }: { username: string }) {
                 id: "live-board",
               }}
             />
-            <SelfVideoTile stream={webrtc.localStream} />
           </div>
 
           <div className="flex flex-col gap-4">
@@ -253,6 +252,11 @@ export default function PlayClient({ username }: { username: string }) {
           {notice}
         </p>
       )}
+
+      {/* Floating draggable self-cam — rendered outside the grid so it can move freely. */}
+      {(phase === "playing" || phase === "over") && (
+        <SelfVideoTile stream={webrtc.localStream} />
+      )}
     </div>
   );
 }
@@ -288,21 +292,77 @@ function Row({
   );
 }
 
+const TILE_W = 160;
+const TILE_H = 120;
+const EDGE = 8;
+
+function clampToViewport(left: number, top: number) {
+  const maxLeft = window.innerWidth - TILE_W - EDGE;
+  const maxTop = window.innerHeight - TILE_H - EDGE;
+  return {
+    left: Math.max(EDGE, Math.min(left, maxLeft)),
+    top: Math.max(EDGE, Math.min(top, maxTop)),
+  };
+}
+
 function SelfVideoTile({ stream }: { stream: MediaStream | null }) {
-  const ref = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  // Position in viewport pixels. null = use the default bottom-right anchor.
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+
   useEffect(() => {
-    if (ref.current) ref.current.srcObject = stream;
+    if (videoRef.current) videoRef.current.srcObject = stream;
   }, [stream]);
+
+  // Re-clamp on viewport resize so the tile doesn't end up off-screen.
+  useEffect(() => {
+    function onResize() {
+      setPos((p) => (p ? clampToViewport(p.left, p.top) : p));
+    }
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const offsetX = e.clientX - rect.left;
+    const offsetY = e.clientY - rect.top;
+
+    function onMove(ev: PointerEvent) {
+      setPos(clampToViewport(ev.clientX - offsetX, ev.clientY - offsetY));
+    }
+    function onUp() {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    }
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
   if (!stream) return null;
+
+  const style: React.CSSProperties = pos
+    ? { top: pos.top, left: pos.left }
+    : { bottom: 16, right: 16 };
+
   return (
-    <div className="absolute bottom-2 right-2 h-24 w-32 overflow-hidden rounded-md border-2 border-white/80 bg-black shadow-lg">
+    <div
+      onPointerDown={onPointerDown}
+      style={{ position: "fixed", touchAction: "none", width: TILE_W, height: TILE_H, ...style }}
+      className="z-50 cursor-grab overflow-hidden rounded-md border-2 border-white/80 bg-black shadow-lg active:cursor-grabbing"
+      title="Drag to move"
+    >
       <video
-        ref={ref}
+        ref={videoRef}
         autoPlay
         playsInline
         muted
-        className="h-full w-full object-cover"
+        className="pointer-events-none h-full w-full object-cover"
       />
+      <span className="pointer-events-none absolute left-1 top-1 rounded bg-black/50 px-1.5 py-0.5 text-[10px] text-white/90">
+        You · drag
+      </span>
     </div>
   );
 }
