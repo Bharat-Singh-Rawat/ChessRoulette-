@@ -174,6 +174,27 @@ export function handleConnection(io: Server, socket: Socket) {
     });
   });
 
+  // --- WebRTC signaling relay --------------------------------------------
+  // We don't inspect payloads — just forward to the other peer in the room.
+  // Authorization comes from the socket already being authed and the gameId
+  // belonging to the user (verified before relay).
+  function relayIfInGame(gameId: string, event: string, payload: unknown) {
+    const game = games.get(gameId);
+    if (!game || game.status !== "in_progress") return;
+    if (!colorFor(game, user.id)) return;
+    socket.to(gameId).emit(event, payload);
+  }
+
+  socket.on("webrtc:offer", (p: { gameId: string; sdp: RTCSessionDescriptionInit }) =>
+    relayIfInGame(p.gameId, "webrtc:offer", { sdp: p.sdp }),
+  );
+  socket.on("webrtc:answer", (p: { gameId: string; sdp: RTCSessionDescriptionInit }) =>
+    relayIfInGame(p.gameId, "webrtc:answer", { sdp: p.sdp }),
+  );
+  socket.on("webrtc:ice", (p: { gameId: string; candidate: RTCIceCandidateInit }) =>
+    relayIfInGame(p.gameId, "webrtc:ice", { candidate: p.candidate }),
+  );
+
   socket.on("disconnect", () => {
     const i = queue.findIndex((q) => q.userId === user.id);
     if (i >= 0) queue.splice(i, 1);
